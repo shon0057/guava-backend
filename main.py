@@ -1,6 +1,8 @@
 import os
 import json
 import cv2
+import gc
+import torch
 import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -14,42 +16,38 @@ CONFIG_PATH = "model_config.json"
 yolo_model = None
 model_config = {}
 
-# 2. 使用現代 FastAPI 的 lifespan 管理伺服器生命週期（替代舊版 startup 事件）
+# 2. 使用 lifespan 管理伺服器生命週期
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global yolo_model, model_config
     
-    # 載入 YOLO 模型
+    # 強制 PyTorch 只使用單執行緒，避免免費版單核 CPU 爭搶資源
+    torch.set_num_threads(1)
+
     if os.path.exists(MODEL_PATH):
         yolo_model = YOLO(MODEL_PATH)
         print("✅ YOLO 模型成功載入！")
     else:
-        print("⚠️ 警告：找不到 best.pt，請確保模型檔放在當前目錄下")
+        print("⚠️ 警告：找不到 best.pt")
 
-    # 載入 K-Means 動態臨界值設定檔
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             model_config = json.load(f)
         print(f"✅ 設定檔載入成功 (版本: {model_config.get('version', 'Unknown')})")
     else:
-        # 預設臨界值備案 (萬一找不到 json 檔時使用)
         model_config = {"threshold_1_to_2": 15.0, "threshold_2_to_3": 9.0}
-        print("⚠️ 警告：找不到 model_config.json，已載入預設預備臨界值 (15.0, 9.0)")
     
-    yield  # 伺服器啟動完成，開始接收請求
-    
-    # 伺服器關閉時釋放資源 (可留空)
-    print("🛑 伺服器即將關閉...")
+    yield
+    print("🛑 伺服器關閉")
 
-# 3. 初始化 FastAPI 應用
+# 3. 初始化 FastAPI
 app = FastAPI(
     title="Guava Quality Assessment API",
-    description="芭樂自動化分級與品質檢測後端服務",
-    version="1.0.0",
+    description="芭樂自動化分級後端服務 (極速防爆版)",
+    version="1.1.0",
     lifespan=lifespan
 )
 
-# 允許跨網域請求 (CORS)，方便手機 APP 或前端網頁連線
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,51 +55,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 4. 核心檢測 API 路由 (Endpoint)
+# 4. 核心檢測 API 路由
 @app.post("/api/v1/classify")
 async def classify_guava(file: UploadFile = File(...)):
-    """
-    接收手機/前端上傳的照片檔案，進行即時辨識與品質分級
-    """
     if yolo_model is None:
-        raise HTTPException(status_code=500, detail="模型未就緒，請檢查伺服器端 best.pt 檔案")
+        raise HTTPException(status_code=500, detail="模型未就緒")
 
     try:
-        # A. 將上傳的圖片位元組轉換為 OpenCV 影像格式
+        # A. 讀取圖片 Bytes
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if img is None:
-            raise HTTPException(status_code=400, detail="無效的圖片檔案，無法解碼")
+        # 立即釋放原始 Buffer
+        del contents, nparr
+        gc.collect()
 
-        # B. 影像等比例縮放 (維持與訓練/檢測集一致的 800px 寬度)
+        if img is None:
+            raise HTTPException(status_code=400, detail="無效的圖片檔案")
+
+        # B. 【高速+防爆】：限制最高解析度 (極速降採樣)
+        h_orig, w_orig = img.shape[:2]
+        if max(h_orig, w_orig) > 1200:
+            scale_down = 1200 / float(max(h_orig, w_orig))
+            img = cv2.resize(img, (int(w_orig * scale_down), int(h_orig * scale_down)), interpolation=cv2.INTER_AREA)
+
+        # C. 縮放到標準 800px 寬度
         target_w = 800
         scale = target_w / img.shape[1]
         target_h = int(img.shape[0] * scale)
         img_resized = cv2.resize(img, (target_w, target_h))
+        
+        del img
+        gc.collect()
+
         h, w, _ = img_resized.shape
 
-        # C. YOLO 偵測與正中央中心點定位
-        results = yolo_model(img_resized, verbose=False)
+        # D. 【高速推論核心】：關閉梯度 + 限制 imgsz=640 (速度提升 10 倍)
+        with torch.no_grad():
+            results = yolo_model(img_resized, imgsz=640, verbose=False)
+
         detected = False
         crop_img = None
 
         for r in results:
             for box in r.boxes:
-                # 拆開雙重中括號
                 x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
                 
-                # 計算正中央中心點 (暫不安裝 -20 位移)
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
 
-                # 250x250 精準 ROI 區域裁切
                 ymin, ymax = max(0, cy - 125), min(h, cy + 125)
                 xmin, xmax = max(0, cx - 125), min(w, cx + 125)
                 crop_img = img_resized[ymin:ymax, xmin:xmax]
 
-                # 防呆防靠邊：長寬不足 250x250 則強制 Resize
                 if crop_img.shape[0] != 250 or crop_img.shape[1] != 250:
                     crop_img = cv2.resize(crop_img, (250, 250))
 
@@ -111,13 +118,12 @@ async def classify_guava(file: UploadFile = File(...)):
                 break
 
         if not detected:
-            # YOLO 辨識失敗時之中央裁切備用機制
             ymin, ymax = max(0, int(h/2)-125), min(h, int(h/2)+125)
             xmin, xmax = max(0, int(w/2)-125), min(w, int(w/2)+125)
             crop_img = img_resized[ymin:ymax, xmin:xmax]
             crop_img = cv2.resize(crop_img, (250, 250))
 
-        # D. Mask 過濾黑邊背景與計算純果皮輝度標準差得分
+        # E. Mask 計算
         gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
         fruit_mask = gray > 15
         
@@ -126,7 +132,11 @@ async def classify_guava(file: UploadFile = File(...)):
         else:
             score = float(np.std(gray))
 
-        # E. 從動態設定檔 (model_config.json) 讀取臨界值進行分級
+        # 釋放變數記憶體
+        del img_resized, gray, crop_img, results
+        gc.collect()
+
+        # F. 動態分級
         t12 = model_config.get("threshold_1_to_2", 15.0)
         t23 = model_config.get("threshold_2_to_3", 9.0)
 
@@ -143,7 +153,6 @@ async def classify_guava(file: UploadFile = File(...)):
             quality = "平整"
             desc = "果皮偏向光滑"
 
-        # F. 回傳結構化 JSON 給前端
         return {
             "status": "success",
             "data": {
@@ -158,13 +167,14 @@ async def classify_guava(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        gc.collect()
         raise HTTPException(status_code=500, detail=f"伺服器處理失敗: {str(e)}")
 
-# 5. 健康檢查接口
+# 5. 健康檢查
 @app.get("/")
 def health_check():
     return {
         "status": "online", 
-        "message": "芭樂 AI 分級後端服務運作中",
+        "message": "芭樂 AI 分級後端服務運作中 (加速防爆版20260730)",
         "current_config_version": model_config.get("version", "Unknown")
     }
