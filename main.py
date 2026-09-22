@@ -209,6 +209,6 @@ async def classify_guava(file: UploadFile = File(...)):
 def health_check():
   return {
       "status": "online",
-      "message": "芭樂 AI 分級後端服務運作中 (加速防爆版20260730)",
+      "message": "芭樂 AI 分級後端服務運作中 (加速防爆版20260922)",
       "current_config_version": model_config.get("version", "Unknown"),
   }
