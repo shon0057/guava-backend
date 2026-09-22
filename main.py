@@ -80,27 +80,14 @@ async def classify_guava(file: UploadFile = File(...)):
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # 立即釋放原始 Buffer
+    # 釋放原始 Buffer
     del contents, nparr
     gc.collect()
 
     if img is None:
       raise HTTPException(status_code=400, detail="無效的圖片檔案")
 
-    # 🎯 3. 儲存 ESP32-CAM 傳過來的原始照片，並印出 Log 與網址
-    save_filename = "latest_guava.jpg"
-    save_path = os.path.join(UPLOAD_DIR, save_filename)
-    cv2.imwrite(save_path, img)
-
-    img_h_raw, img_w_raw = img.shape[:2]
-    image_public_url = f"https://guava-backend-ekg3.onrender.com/static/uploads/{save_filename}"
-
-    print(
-        f"\n📸 [ESP32-CAM Shot Received] Size: {img_w_raw}x{img_h_raw} px"
-    )
-    print(f"🔗 View image directly at: {image_public_url}\n")
-
-    # B. 【高速+防爆】：限制最高解析度 (極速降採樣)
+    # B. 【高速+防爆】：限制最高解析度
     h_orig, w_orig = img.shape[:2]
     if max(h_orig, w_orig) > 1200:
       scale_down = 1200 / float(max(h_orig, w_orig))
@@ -121,23 +108,46 @@ async def classify_guava(file: UploadFile = File(...)):
 
     h, w, _ = img_resized.shape
 
-    # D. 【高速推論核心】：關閉梯度 + 限制 imgsz=640 (速度提升 10 倍)
+    # D. 【高速推論核心】：YOLO 偵測
     with torch.no_grad():
       results = yolo_model(img_resized, imgsz=640, verbose=False)
 
     detected = False
     crop_img = None
 
+    # 複製一份影像用於繪製網頁顯示的標註圖 (Annotated Image)
+    annotated_img = img_resized.copy()
+
     for r in results:
       for box in r.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
+        conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+
+        # 🎯 畫上 YOLO 綠色框 (Bounding Box) 與 信心度文字
+        cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        label_text = f"Guava {conf:.2f}"
+        cv2.putText(
+            annotated_img,
+            label_text,
+            (x1, max(25, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+        )
 
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
 
+        # 裁切 ROI (250x250) 供後續 K-Means 質地計算
         ymin, ymax = max(0, cy - 125), min(h, cy + 125)
         xmin, xmax = max(0, cx - 125), min(w, cx + 125)
         crop_img = img_resized[ymin:ymax, xmin:xmax]
+
+        # 畫上紅框代表實際採樣分析的 ROI 區域
+        cv2.rectangle(
+            annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2
+        )
 
         if crop_img.shape[0] != 250 or crop_img.shape[1] != 250:
           crop_img = cv2.resize(crop_img, (250, 250))
@@ -148,10 +158,34 @@ async def classify_guava(file: UploadFile = File(...)):
         break
 
     if not detected:
+      # 沒偵測到目標時：在圖片上方標示紅色警告文字，並抓中央區域
+      cv2.putText(
+          annotated_img,
+          "NO GUAVA DETECTED (Fallback Center)",
+          (20, 40),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.8,
+          (0, 0, 255),
+          2,
+      )
+
       ymin, ymax = max(0, int(h / 2) - 125), min(h, int(h / 2) + 125)
       xmin, xmax = max(0, int(w / 2) - 125), min(w, int(w / 2) + 125)
+      cv2.rectangle(annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
       crop_img = img_resized[ymin:ymax, xmin:xmax]
       crop_img = cv2.resize(crop_img, (250, 250))
+
+    # 🎯 儲存帶有 YOLO 標註/畫框的照片
+    save_filename = "latest_guava.jpg"
+    save_path = os.path.join(UPLOAD_DIR, save_filename)
+    cv2.imwrite(save_path, annotated_img)
+
+    image_public_url = f"https://guava-backend-ekg3.onrender.com/static/uploads/{save_filename}"
+    print(
+        f"\n📸 [ESP32-CAM Shot Received] Size: {w}x{h} px | YOLO Detected:"
+        f" {detected}"
+    )
+    print(f"🔗 View marked image at: {image_public_url}\n")
 
     # E. Mask 計算
     gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
@@ -163,7 +197,7 @@ async def classify_guava(file: UploadFile = File(...)):
       score = float(np.std(gray))
 
     # 釋放變數記憶體
-    del img_resized, gray, crop_img, results
+    del img_resized, annotated_img, gray, crop_img, results
     gc.collect()
 
     # F. 動態分級
@@ -192,7 +226,7 @@ async def classify_guava(file: UploadFile = File(...)):
             "quality": quality,
             "description": desc,
             "yolo_detected": detected,
-            "image_url": image_public_url,  # 👈 4. 回傳 JSON 也附帶圖片網址
+            "image_url": image_public_url,
             "version": model_config.get("version", "Unknown"),
         },
     }
