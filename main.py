@@ -206,15 +206,15 @@ async def classify_guava(file: UploadFile = File(...)):
 
     if score >= t12:
       group = 1
-      quality = "極佳"
+      quality = "Excellent"
       desc = "果皮凹凸顆粒飽滿"
     elif score >= t23:
       group = 2
-      quality = "良好"
+      quality = "Good"
       desc = "果皮質地中等"
     else:
       group = 3
-      quality = "平整"
+      quality = "Smooth"
       desc = "果皮偏向光滑"
 
     return {
