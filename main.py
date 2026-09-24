@@ -5,16 +5,16 @@ import os
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles  # 👈 1. 引入 StaticFiles
+from fastapi.staticfiles import StaticFiles  
 import numpy as np
 import torch
 from ultralytics import YOLO
 
-# 1. 全域變數與檔案路徑設定
+#檔案路徑設定
 MODEL_PATH = "best.pt"
 CONFIG_PATH = "model_config.json"
 
-# 🎯 建立 static 資料夾用於儲存 ESP32-CAM 上傳的照片
+#建立static資料夾儲存CAM照片
 UPLOAD_DIR = "static/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -22,25 +22,25 @@ yolo_model = None
 model_config = {}
 
 
-# 2. 使用 lifespan 管理伺服器生命週期
+#使用 lifespan 管理伺服器生命週期
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   global yolo_model, model_config
 
-  # 強制 PyTorch 只使用單執行緒，避免免費版單核 CPU 爭搶資源
+  # 強制PyTorch使用單執行緒
   torch.set_num_threads(1)
 
   if os.path.exists(MODEL_PATH):
     yolo_model = YOLO(MODEL_PATH)
-    print("✅ YOLO 模型成功載入！")
+    print("YOLO 模型成功載入！")
   else:
-    print("⚠️ 警告：找不到 best.pt")
+    print(" 警告：找不到 best.pt")
 
   if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
       model_config = json.load(f)
     print(
-        f"✅ 設定檔載入成功 (版本: {model_config.get('version', 'Unknown')})"
+        f"設定檔載入成功 (版本: {model_config.get('version', 'Unknown')})"
     )
   else:
     model_config = {"threshold_1_to_2": 15.0, "threshold_2_to_3": 9.0}
@@ -49,15 +49,15 @@ async def lifespan(app: FastAPI):
   print("🛑 伺服器關閉")
 
 
-# 3. 初始化 FastAPI
+#FastAPI
 app = FastAPI(
     title="Guava Quality Assessment API",
-    description="芭樂自動化分級後端服務 (極速防爆版)",
+    description="芭樂自動化分級後端服務",
     version="1.2.0",
     lifespan=lifespan,
 )
 
-# 👈 2. 掛載 /static 路徑，讓外部瀏覽器可以直接存取照片
+#掛載/static讓外部可以存取
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
@@ -68,26 +68,25 @@ app.add_middleware(
 )
 
 
-# 4. 核心檢測 API 路由
+#檢測API 
 @app.post("/api/v1/classify")
 async def classify_guava(file: UploadFile = File(...)):
   if yolo_model is None:
     raise HTTPException(status_code=500, detail="模型未就緒")
 
   try:
-    # A. 讀取圖片 Bytes
+    #讀取圖片Bytes
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # 釋放原始 Buffer
     del contents, nparr
     gc.collect()
 
     if img is None:
       raise HTTPException(status_code=400, detail="無效的圖片檔案")
 
-    # B. 【高速+防爆】：限制最高解析度
+    #限制最高解析度
     h_orig, w_orig = img.shape[:2]
     if max(h_orig, w_orig) > 1200:
       scale_down = 1200 / float(max(h_orig, w_orig))
@@ -97,7 +96,7 @@ async def classify_guava(file: UploadFile = File(...)):
           interpolation=cv2.INTER_AREA,
       )
 
-    # C. 縮放到標準 800px 寬度
+    # 縮放到800px 寬度
     target_w = 800
     scale = target_w / img.shape[1]
     target_h = int(img.shape[0] * scale)
@@ -108,14 +107,14 @@ async def classify_guava(file: UploadFile = File(...)):
 
     h, w, _ = img_resized.shape
 
-    # D. 【高速推論核心】：YOLO 偵測
+    # YOLO 偵測
     with torch.no_grad():
       results = yolo_model(img_resized, imgsz=640, verbose=False)
 
     detected = False
     crop_img = None
 
-    # 複製一份影像用於繪製網頁顯示的標註圖 (Annotated Image)
+    # 繪製網頁顯示的標註圖
     annotated_img = img_resized.copy()
 
     for r in results:
@@ -123,7 +122,7 @@ async def classify_guava(file: UploadFile = File(...)):
         x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
         conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
 
-        # 🎯 畫上 YOLO 綠色框 (Bounding Box) 與 信心度文字
+        # 畫上 YOLO 綠色框 
         cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
         label_text = f"Guava {conf:.2f}"
         cv2.putText(
@@ -139,12 +138,12 @@ async def classify_guava(file: UploadFile = File(...)):
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
 
-        # 裁切 ROI (250x250) 供後續 K-Means 質地計算
+        # 裁切 (250x250) 供後續 K-Means 計算
         ymin, ymax = max(0, cy - 125), min(h, cy + 125)
         xmin, xmax = max(0, cx - 125), min(w, cx + 125)
         crop_img = img_resized[ymin:ymax, xmin:xmax]
 
-        # 畫上紅框代表實際採樣分析的 ROI 區域
+        # 畫上紅框代表實際採樣分析區域
         cv2.rectangle(
             annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2
         )
@@ -175,7 +174,7 @@ async def classify_guava(file: UploadFile = File(...)):
       crop_img = img_resized[ymin:ymax, xmin:xmax]
       crop_img = cv2.resize(crop_img, (250, 250))
 
-    # 🎯 儲存帶有 YOLO 標註/畫框的照片
+    # 儲存標註的照片
     save_filename = "latest_guava.jpg"
     save_path = os.path.join(UPLOAD_DIR, save_filename)
     cv2.imwrite(save_path, annotated_img)
@@ -187,7 +186,7 @@ async def classify_guava(file: UploadFile = File(...)):
     )
     print(f"🔗 View marked image at: {image_public_url}\n")
 
-    # E. Mask 計算
+    # Mask 計算
     gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
     fruit_mask = gray > 15
 
@@ -200,7 +199,6 @@ async def classify_guava(file: UploadFile = File(...)):
     del img_resized, annotated_img, gray, crop_img, results
     gc.collect()
 
-    # F. 動態分級
     t12 = model_config.get("threshold_1_to_2", 15.0)
     t23 = model_config.get("threshold_2_to_3", 9.0)
 
@@ -238,11 +236,11 @@ async def classify_guava(file: UploadFile = File(...)):
     )
 
 
-# 5. 健康檢查
+# 5. 檢查
 @app.get("/")
 def health_check():
   return {
       "status": "online",
-      "message": "芭樂 AI 分級後端服務運作中 (加速防爆版20260922)",
+      "message": "芭樂 AI 分級後端服務運作中 (20260922)",
       "current_config_version": model_config.get("version", "Unknown"),
   }
