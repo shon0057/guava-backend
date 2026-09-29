@@ -25,12 +25,12 @@ yolo_model = None
 model_config = {}
 
 
-# 使用 lifespan 管理伺服器生命週期
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   global yolo_model, model_config
 
-  # 強制 PyTorch 使用單執行緒以節省 Render CPU 與 RAM 資源
+  # 🎯 【記憶體優化 1】：全域關閉 PyTorch 梯度計算 & 限制單執行緒
+  torch.set_grad_enabled(False)
   torch.set_num_threads(1)
 
   if os.path.exists(MODEL_PATH):
@@ -52,15 +52,13 @@ async def lifespan(app: FastAPI):
   print("🛑 伺服器關閉")
 
 
-# FastAPI
 app = FastAPI(
     title="Guava Quality Assessment API",
     description="芭樂自動化分級後端服務",
-    version="1.2.0",
+    version="1.2.1",
     lifespan=lifespan,
 )
 
-# 掛載 /static 讓外部可以存取
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
@@ -71,90 +69,83 @@ app.add_middleware(
 )
 
 
-# 檢測 API
 @app.post("/api/v1/classify")
 async def classify_guava(file: UploadFile = File(...)):
   if yolo_model is None:
     raise HTTPException(status_code=500, detail="模型未就緒")
 
   try:
-    # 讀取圖片 Bytes
+    # 🎯 【記憶體優化 2】：讀取位元組後立即解構
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+    # 立即釋放原始暫存檔
     del contents, nparr
     gc.collect()
 
-    if img is None:
+    if img_raw is None:
       raise HTTPException(status_code=400, detail="無效的圖片檔案")
 
-    # 🎯【關鍵優化】：直接縮放到 640px 寬度，徹底防範 Render 512MB 記憶體溢出 (OOM)
+    # 🎯 【記憶體優化 3】：一拿到圖片立刻以最省 RAM 的方式縮放至 640px 寬
+    h_raw, w_raw = img_raw.shape[:2]
     target_w = 640
-    scale = target_w / img.shape[1]
-    target_h = int(img.shape[0] * scale)
-    img_resized = cv2.resize(
-        img, (target_w, target_h), interpolation=cv2.INTER_AREA
-    )
+    target_h = int(h_raw * (target_w / float(w_raw)))
 
-    del img
+    img_resized = cv2.resize(
+        img_raw, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+    )
+    del img_raw  # 釋放高解析度原圖
     gc.collect()
 
     h, w, _ = img_resized.shape
 
-    # 🎯【關鍵優化】：限定 conf=0.5 與 max_det=1，加速 NMS 消除警告
-    with torch.no_grad():
-      results = yolo_model(
-          img_resized, imgsz=640, conf=0.5, max_det=1, verbose=False
-      )
+    # 🎯 【記憶體優化 4】：YOLO 輕量推論設定
+    results = yolo_model(
+        img_resized,
+        imgsz=640,
+        conf=0.45,
+        max_det=1,
+        verbose=False,
+        half=False,  # CPU 模式下關閉 FP16 避免異常複製
+    )
 
     detected = False
     crop_img = None
-
-    # 繪製網頁顯示的標註圖
     annotated_img = img_resized.copy()
 
-    for r in results:
-      for box in r.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
-        conf = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+    if len(results) > 0 and len(results[0].boxes) > 0:
+      box = results[0].boxes[0]
+      x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
+      conf = float(box.conf[0])
 
-        # 畫上 YOLO 綠色框
-        cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        label_text = f"Guava {conf:.2f}"
-        cv2.putText(
-            annotated_img,
-            label_text,
-            (x1, max(25, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2,
-        )
+      # 畫綠框
+      cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+      cv2.putText(
+          annotated_img,
+          f"Guava {conf:.2f}",
+          (x1, max(25, y1 - 10)),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.8,
+          (0, 255, 0),
+          2,
+      )
 
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
+      # 計算中心點與 250x250 ROI
+      cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+      ymin, ymax = max(0, cy - 125), min(h, cy + 125)
+      xmin, xmax = max(0, cx - 125), min(w, cx + 125)
 
-        # 裁切 (250x250) 供後續 K-Means 計算
-        ymin, ymax = max(0, cy - 125), min(h, cy + 125)
-        xmin, xmax = max(0, cx - 125), min(w, cx + 125)
-        crop_img = img_resized[ymin:ymax, xmin:xmax]
+      crop_img = img_resized[ymin:ymax, xmin:xmax].copy()
+      cv2.rectangle(annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+      detected = True
 
-        # 畫上紅框代表實際採樣分析區域
-        cv2.rectangle(
-            annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2
-        )
+    # 釋放 YOLO 內部推論矩陣
+    del results
+    gc.collect()
 
-        if crop_img.shape[0] != 250 or crop_img.shape[1] != 250:
-          crop_img = cv2.resize(crop_img, (250, 250))
-
-        detected = True
-        break
-      if detected:
-        break
-
+    # 備援機制 (未偵測到時)
     if not detected:
-      # 沒偵測到目標時：在圖片上方標示紅色警告文字，並抓中央區域
       cv2.putText(
           annotated_img,
           "NO GUAVA DETECTED (Fallback Center)",
@@ -164,27 +155,27 @@ async def classify_guava(file: UploadFile = File(...)):
           (0, 0, 255),
           2,
       )
-
       ymin, ymax = max(0, int(h / 2) - 125), min(h, int(h / 2) + 125)
       xmin, xmax = max(0, int(w / 2) - 125), min(w, int(w / 2) + 125)
       cv2.rectangle(annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
-      crop_img = img_resized[ymin:ymax, xmin:xmax]
+      crop_img = img_resized[ymin:ymax, xmin:xmax].copy()
+
+    if crop_img.shape[0] != 250 or crop_img.shape[1] != 250:
       crop_img = cv2.resize(crop_img, (250, 250))
 
-    # 儲存標註的照片
+    # 儲存標註照片
     save_filename = "latest_guava.jpg"
     save_path = os.path.join(UPLOAD_DIR, save_filename)
     cv2.imwrite(save_path, annotated_img)
 
-    image_public_url = f"https://guava-backend-ekg3.onrender.com/static/uploads/{save_filename}"
-    print(
-        f"\n📸 [ESP32-CAM Shot Received] Size: {w}x{h} px | YOLO Detected:"
-        f" {detected}"
-    )
-    print(f"🔗 View marked image at: {image_public_url}\n")
+    del img_resized, annotated_img
+    gc.collect()
 
-    # Mask 計算
+    image_public_url = f"https://guava-backend-ekg3.onrender.com/static/uploads/{save_filename}"
+
+    # 計算 K-Means 特徵 (灰階標準差)
     gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+    del crop_img
     fruit_mask = gray > 15
 
     if np.sum(fruit_mask) > 0:
@@ -192,10 +183,10 @@ async def classify_guava(file: UploadFile = File(...)):
     else:
       score = float(np.std(gray))
 
-    # 釋放變數記憶體
-    del img_resized, annotated_img, gray, crop_img, results
+    del gray, fruit_mask
     gc.collect()
 
+    # 門檻與分級
     t12 = model_config.get("threshold_1_to_2", 28.01)
     t23 = model_config.get("threshold_2_to_3", 22.51)
 
@@ -233,11 +224,10 @@ async def classify_guava(file: UploadFile = File(...)):
     )
 
 
-# 5. 健康檢查
 @app.get("/")
 def health_check():
   return {
       "status": "online",
-      "message": "芭樂 AI 分級後端服務運作中 (20260929)",
+      "message": "芭樂 AI 分級後端服務運作中 (20260929-LowRAM)",
       "current_config_version": model_config.get("version", "Unknown"),
   }
