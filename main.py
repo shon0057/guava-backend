@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
+from datetime import datetime
 import gc
+import glob
 import json
 import os
+import uuid
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,16 +25,28 @@ yolo_model = None
 model_config = {}
 
 
+# 輔助函式：自動清理舊圖片，只保留最近 N 張，避免佔用過多硬碟空間
+def cleanup_old_images(max_keep: int = 20):
+  try:
+    files = glob.glob(os.path.join(UPLOAD_DIR, "guava_*.jpg"))
+    if len(files) > max_keep:
+      # 依照建立/修改時間由舊到新排序
+      files.sort(key=os.path.getmtime)
+      for old_file in files[:-max_keep]:
+        os.remove(old_file)
+  except Exception as e:
+    print(f"⚠️ 清理舊圖時發生警告: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   global yolo_model, model_config
 
-  # 🎯 全域強制極簡模式：關閉梯度追蹤與單執行緒，降低模型記憶體腳印
+  # 全域強制極簡模式：關閉梯度追蹤與單執行緒，降低模型記憶體腳印
   torch.set_grad_enabled(False)
   torch.set_num_threads(1)
 
   if os.path.exists(MODEL_PATH):
-    # 載入模型時即關閉 fuse/eval 以外的多餘暫存
     yolo_model = YOLO(MODEL_PATH)
     yolo_model.to("cpu")
     print("YOLO 模型成功載入！")
@@ -54,7 +69,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Guava Quality Assessment API",
     description="芭樂自動化分級後端服務",
-    version="1.2.2-ultra-low-ram",
+    version="1.2.3-unique-images",
     lifespan=lifespan,
 )
 
@@ -74,7 +89,6 @@ async def classify_guava(file: UploadFile = File(...)):
     raise HTTPException(status_code=500, detail="模型未就緒")
 
   try:
-    # 🎯 採用 chunk 串流讀取，避免在大檔案上產生額外 memory buffer
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -85,7 +99,7 @@ async def classify_guava(file: UploadFile = File(...)):
     if img_raw is None:
       raise HTTPException(status_code=400, detail="無效的圖片檔案")
 
-    # 🎯 第一時間直接壓到 640px，並強制轉為 uint8 contiguous array 節省記憶體
+    # 第一時間縮放至 640px
     h_raw, w_raw = img_raw.shape[:2]
     target_w = 640
     target_h = int(h_raw * (640.0 / w_raw))
@@ -98,7 +112,7 @@ async def classify_guava(file: UploadFile = File(...)):
 
     h, w, _ = img_resized.shape
 
-    # 🎯 使用 PyTorch 最高階的 inference_mode()，徹底停用推論中間態記憶體保存
+    # 推論極速唯讀模式
     with torch.inference_mode():
       results = yolo_model.predict(
           source=img_resized,
@@ -114,13 +128,11 @@ async def classify_guava(file: UploadFile = File(...)):
     crop_img = None
     annotated_img = img_resized.copy()
 
-    # 提取辨識結果
     if len(results) > 0 and len(results[0].boxes) > 0:
       box = results[0].boxes[0]
       x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
       conf = float(box.conf[0])
 
-      # 畫綠框與標籤
       cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
       cv2.putText(
           annotated_img,
@@ -132,7 +144,6 @@ async def classify_guava(file: UploadFile = File(...)):
           2,
       )
 
-      # 算 ROI (250x250)
       cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
       ymin, ymax = max(0, cy - 125), min(h, cy + 125)
       xmin, xmax = max(0, cx - 125), min(w, cx + 125)
@@ -141,11 +152,9 @@ async def classify_guava(file: UploadFile = File(...)):
       cv2.rectangle(annotated_img, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
       detected = True
 
-    # 立即銷毀 YOLO 推論結果物件
     del results
     gc.collect()
 
-    # Fallback 備援 (沒偵測到時)
     if not detected:
       cv2.putText(
           annotated_img,
@@ -164,15 +173,26 @@ async def classify_guava(file: UploadFile = File(...)):
     if crop_img.shape[0] != 250 or crop_img.shape[1] != 250:
       crop_img = cv2.resize(crop_img, (250, 250))
 
-    # 儲存繪製標註後的靜態圖
-    save_filename = "latest_guava.jpg"
+    # 🎯 產生獨立且不重複的檔名 (時間戳記 + 8碼UUID)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid.uuid4().hex[:8]
+    save_filename = f"guava_{timestamp}_{unique_id}.jpg"
     save_path = os.path.join(UPLOAD_DIR, save_filename)
     cv2.imwrite(save_path, annotated_img)
+
+    # 清理超過 20 張的舊圖片
+    cleanup_old_images(max_keep=20)
 
     del img_resized, annotated_img
     gc.collect()
 
     image_public_url = f"https://guava-backend-ekg3.onrender.com/static/uploads/{save_filename}"
+
+    print(
+        f"\n📸 [Shot Received] Processing Size: {w}x{h} px | YOLO Detected:"
+        f" {detected}"
+    )
+    print(f"🔗 View marked image at: {image_public_url}\n")
 
     # K-Means 質地計算 (灰階標準差)
     gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
@@ -229,6 +249,6 @@ async def classify_guava(file: UploadFile = File(...)):
 def health_check():
   return {
       "status": "online",
-      "message": "芭樂 AI 分級後端服務運作中 (Ultra-Low-RAM)",
+      "message": "芭樂 AI 分級後端服務運作中 (Unique-Images)",
       "current_config_version": model_config.get("version", "Unknown"),
   }
