@@ -1,9 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.10.0+cpu
-torchvision
 fastapi
 uvicorn
 python-multipart
 opencv-python-headless
 numpy
+torch==2.10.0+cpu
+torchvision==0.25.0+cpu
 ultralytics>=8.4.0
