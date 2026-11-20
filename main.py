@@ -359,7 +359,7 @@ async def classify_fruit(file: UploadFile = File(...)):
     del results
     gc.collect()
 
-    # 若未偵測到任何水果的防呆機制
+        # 若未偵測到任何水果的防呆機制
     if not detected:
       cv2.putText(
           annotated_img,
@@ -375,55 +375,63 @@ async def classify_fruit(file: UploadFile = File(...)):
           max(0, h // 2 - 125),
           min(w, w // 2 + 125),
           min(h, h // 2 + 125),
-)
-analysis_res = analyze_guava(
-img_resized,
-annotated_img,
-fallback_box,
-model_config.get("guava", {}),
-)
-analysis_res["fruit_type"] = "unknown"
-analysis_res["fruit_name_zh"] = "未偵測到目標"
-# 儲存標註結果圖
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-unique_id = uuid.uuid4().hex[:8]
-save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
-save_path = os.path.join(UPLOAD_DIR, save_filename)
-cv2.imwrite(save_path, annotated_img)
-cleanup_old_images(max_keep=20)
-del img_resized, annotated_img
-gc.collect()
-image_public_url = f"onrender.com{save_filename}"
-print(
-f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
-f" {analysis_res['score']} | Group: {analysis_res['group']}"
-)
-  return {
-    "status": "success",
-    "data": {
-    "filename": file.filename,
-    "fruit_type": analysis_res["fruit_type"],
-    "fruit_name_zh": analysis_res["fruit_name_zh"],
-    "score": analysis_res["score"],
-    "group": analysis_res["group"],
-    "quality": analysis_res["quality"],
-    "description": analysis_res["description"],
-    "metrics": analysis_res["metrics"],
-    "yolo_detected": detected,
-    "image_url": image_public_url,
-    "version": model_config.get("version", "Unknown"),
-  },
-}
-except Exception as e:
-gc.collect()
-raise HTTPException(
-  status_code=500, detail=f"伺服器處理失敗: {str(e)}"
-)
+      )
+      analysis_res = analyze_guava(
+          img_resized,
+          annotated_img,
+          fallback_box,
+          model_config.get("guava", {}),
+      )
+      analysis_res["fruit_type"] = "unknown"
+      analysis_res["fruit_name_zh"] = "未偵測到目標"
+
+    # 儲存標註結果圖
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid.uuid4().hex[:8]
+    save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
+    save_path = os.path.join(UPLOAD_DIR, save_filename)
+    cv2.imwrite(save_path, annotated_img)
+
+    cleanup_old_images(max_keep=20)
+    del img_resized, annotated_img
+    gc.collect()
+
+    image_public_url = f"https://onrender.com{save_filename}"
+
+    print(
+        f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
+        f" {analysis_res['score']} | Group: {analysis_res['group']}"
+    )
+
+    return {
+        "status": "success",
+        "data": {
+            "filename": file.filename,
+            "fruit_type": analysis_res["fruit_type"],
+            "fruit_name_zh": analysis_res["fruit_name_zh"],
+            "score": analysis_res["score"],
+            "group": analysis_res["group"],
+            "quality": analysis_res["quality"],
+            "description": analysis_res["description"],
+            "metrics": analysis_res["metrics"],
+            "yolo_detected": detected,
+            "image_url": image_public_url,
+            "version": model_config.get("version", "Unknown"),
+        },
+    }
+
+  except Exception as e:
+    gc.collect()
+    raise HTTPException(
+        status_code=500, detail=f"伺服器處理失敗: {str(e)}"
+    )
+
+
 @app.get("/")
 def health_check():
-return {
-  "status": "online",
-  "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
-  "supported_classes": list(yolo_model.names.values()) if yolo_model else [],
-  "current_config_version": model_config.get("version", "Unknown"),
-}
+  return {
+      "status": "online",
+      "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
+      "supported_classes": list(yolo_model.names.values()) if yolo_model else [],
+      "current_config_version": model_config.get("version", "Unknown"),
+  }
