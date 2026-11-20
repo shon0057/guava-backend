@@ -366,29 +366,29 @@ async def classify_fruit(file: UploadFile = File(...)):
 
     # 若未偵測到任何水果的防呆機制
     if not detected:
-      cv2.putText(
-          annotated_img,
-          "NO FRUIT DETECTED (Fallback Center)",
-          (20, 40),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.75,
-          (0, 0, 255),
-          2,
-      )
-fallback_box = (
-  max(0, w // 2 - 125),
-  max(0, h // 2 - 125),
-  min(w, w // 2 + 125),
-  min(h, h // 2 + 125),
-)
-analysis_res = analyze_guava(
-  img_resized,
-  annotated_img,
-  fallback_box,
-  model_config.get("guava", {}),
-)
-analysis_res["fruit_type"] = "unknown"
-analysis_res["fruit_name_zh"] = "未偵測到目標"
+          cv2.putText(
+              annotated_img,
+              "NO FRUIT DETECTED (Fallback Center)",
+              (20, 40),
+              cv2.FONT_HERSHEY_SIMPLEX,
+              0.75,
+              (0, 0, 255),
+              2,
+          )
+          fallback_box = (  # <-- 這裡的 f 要跟上面 cv2 的 c 垂直對齊（6 個空白）
+              max(0, w // 2 - 125),
+              max(0, h // 2 - 125),
+              min(w, w // 2 + 125),
+              min(h, h // 2 + 125),
+          )
+          analysis_res = analyze_guava(
+              img_resized,
+              annotated_img,
+              fallback_box,
+              model_config.get("guava", {}),
+          )
+          analysis_res["fruit_type"] = "unknown"
+          analysis_res["fruit_name_zh"] = "未偵測到目標"
 # 儲存標註結果圖
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 unique_id = uuid.uuid4().hex[:8]
