@@ -19,6 +19,7 @@ os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 MODEL_PATH = "best.pt"
 CONFIG_PATH = "model_config.json"
 UPLOAD_DIR = "static/uploads"
+BASE_URL = "https://guava-backend-ekg3.onrender.com"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 yolo_model = None
@@ -167,7 +168,6 @@ def analyze_watermelon(
   xmin, ymin = max(0, x1 + pad_x), max(0, y1 + pad_y)
   xmax, ymax = min(w, x2 - pad_x), min(h, y2 - pad_y)
 
-  # 防呆：若偵測框過小導致裁切無效，改用原偵測框
   if xmax <= xmin or ymax <= ymin:
     xmin, ymin, xmax, ymax = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
@@ -184,7 +184,6 @@ def analyze_watermelon(
   # 2. 轉換至 Lab 色彩空間並執行 K-Means (K=2: 深色黑紋 vs 淺綠底色)
   lab_img = cv2.cvtColor(roi_small, cv2.COLOR_BGR2Lab)
   del roi_small
-  # 取 L(亮度) 與 a(綠紅軸) 進行聚類，抗反光效果最佳
   pixel_values = lab_img[:, :, :2].reshape((-1, 2)).astype(np.float32)
 
   criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
@@ -192,7 +191,6 @@ def analyze_watermelon(
       pixel_values, 2, None, criteria, 3, cv2.KMEANS_PP_CENTERS
   )
 
-  # 依據聚類中心的 L (亮度) 排序，自動鎖定亮度較低的那一群為「黑紋路」
   dark_idx = int(np.argmin(centers[:, 0]))
   light_idx = 1 - dark_idx
   stripe_mask = (labels.flatten() == dark_idx).reshape(200, 200).astype(
@@ -204,10 +202,8 @@ def analyze_watermelon(
   stripe_mask = cv2.morphologyEx(stripe_mask, cv2.MORPH_OPEN, kernel)
 
   # 3. 計算黑紋特徵指標
-  # (a) 黑紋面積占比 (%)
   stripe_ratio = float(np.sum(stripe_mask > 0) / stripe_mask.size * 100.0)
 
-  # (b) 黑紋平均粗細 (利用距離變換計算半徑並乘以 2，再依比例還原回原圖像素尺度)
   dist_transform = cv2.distanceTransform(stripe_mask, cv2.DIST_L2, 5)
   scale_factor = ((roi_w / 200.0) + (roi_h / 200.0)) / 2.0
   if np.sum(dist_transform > 0) > 0:
@@ -217,10 +213,9 @@ def analyze_watermelon(
   else:
     avg_width_px = 0.0
 
-  # (c) 黑紋與果皮底色的亮度對比度 (成熟度指標)
   contrast_diff = float(abs(centers[light_idx][0] - centers[dark_idx][0]))
 
-  # 4. 視覺化加分：把 K-means 抓出的黑紋輪廓描繪在回傳圖片上 (黃色細線)
+  # 4. 視覺化：把 K-means 抓出的黑紋輪廓描繪在回傳圖片上 (黃色細線)
   mask_restored = cv2.resize(
       stripe_mask, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST
   )
@@ -230,6 +225,7 @@ def analyze_watermelon(
   cv2.drawContours(
       annotated_img[ymin:ymax, xmin:xmax], contours, -1, (0, 255, 255), 1
   )
+
   del (
       lab_img,
       pixel_values,
@@ -261,19 +257,22 @@ def analyze_watermelon(
         "Standard",
         f"黑紋較細窄 (均寬 {avg_width_px:.1f}px)，預測標準甜度 (<10°Brix)",
     )
+
+  # ✅ 修正 1：return 必須對齊函式層級，不能縮排在 else 裡面
   return {
-    "fruit_type": "watermelon",
-    "fruit_name_zh": "小玉西瓜",
-    "score": round(avg_width_px, 2),
-    "group": group,
-    "quality": quality,
-    "description": desc,
-    "metrics": {
-      "stripe_width_px": round(avg_width_px, 2),
-      "stripe_ratio_pct": round(stripe_ratio, 2),
-      "contrast_diff": round(contrast_diff, 2),
-    },
+      "fruit_type": "watermelon",
+      "fruit_name_zh": "小玉西瓜",
+      "score": round(avg_width_px, 2),
+      "group": group,
+      "quality": quality,
+      "description": desc,
+      "metrics": {
+          "stripe_width_px": round(avg_width_px, 2),
+          "stripe_ratio_pct": round(stripe_ratio, 2),
+          "contrast_diff": round(contrast_diff, 2),
+      },
   }
+
 
 @app.post("/api/v1/classify")
 async def classify_fruit(file: UploadFile = File(...)):
@@ -369,38 +368,43 @@ async def classify_fruit(file: UploadFile = File(...)):
           0.75,
           (0, 0, 255),
           2,
-      ) 
+      )
       fallback_box = (
-        max(0, w // 2 - 125),
-        max(0, h // 2 - 125),
-        min(w, w // 2 + 125),
-        min(h, h // 2 + 125),
+          max(0, w // 2 - 125),
+          max(0, h // 2 - 125),
+          min(w, w // 2 + 125),
+          min(h, h // 2 + 125),
       )
       analysis_res = analyze_guava(
-        img_resized,
-        annotated_img,
-        fallback_box,
-        model_config.get("guava", {}),
+          img_resized,
+          annotated_img,
+          fallback_box,
+          model_config.get("guava", {}),
       )
       analysis_res["fruit_type"] = "unknown"
       analysis_res["fruit_name_zh"] = "未偵測到目標"
-      
+
+    # ✅ 修正 2 & 3 & 4：移出 if not detected 區塊、補上 datetime.now() 與完整網址
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_id = uuid.uuid4().hex[:8]
     save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
     save_path = os.path.join(UPLOAD_DIR, save_filename)
     cv2.imwrite(save_path, annotated_img)
+
+    # 順便覆蓋存一份固定除錯圖
+    cv2.imwrite(os.path.join(UPLOAD_DIR, "latest_guava.jpg"), annotated_img)
+
     cleanup_old_images(max_keep=20)
     del img_resized, annotated_img
     gc.collect()
 
-    image_public_url = (
-        f"https://onrender.com{save_filename}"
-    )
+    image_public_url = f"{BASE_URL}/static/uploads/{save_filename}"
     print(
-        f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
+        f"\n📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
         f" {analysis_res['score']} | Group: {analysis_res['group']}"
     )
+    print(f"🔗 View marked image at: {image_public_url}\n")
+
     return {
         "status": "success",
         "data": {
@@ -420,13 +424,15 @@ async def classify_fruit(file: UploadFile = File(...)):
 
   except Exception as e:
     gc.collect()
-    raise HTTPException(status_code=500, detail=f"伺服器處理失敗: {str(e)}")
-
+    raise HTTPException(
+        status_code=500, detail=f"伺服器處理失敗: {str(e)}"
+    )
+# ✅ 修正 5：移出 except 區塊，恢復頂層路由
 @app.get("/")
 def health_check():
   return {
       "status": "online",
-      "message": "芭樂 & 小玉西瓜AI分級後端運作中",
+      "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
       "model_file_exists": os.path.exists(MODEL_PATH),
       "model_loaded": yolo_model is not None,
       "current_config_version": model_config.get("version", "Unknown"),
