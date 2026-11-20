@@ -261,19 +261,19 @@ def analyze_watermelon(
         "Standard",
         f"黑紋較細窄 (均寬 {avg_width_px:.1f}px)，預測標準甜度 (<10°Brix)",
     )
-    return {
-      "fruit_type": "watermelon",
-      "fruit_name_zh": "小玉西瓜",
-      "score": round(avg_width_px, 2),
-      "group": group,
-      "quality": quality,
-      "description": desc,
-      "metrics": {
-          "stripe_width_px": round(avg_width_px, 2),
-          "stripe_ratio_pct": round(stripe_ratio, 2),
-          "contrast_diff": round(contrast_diff, 2),
-      },
-    }
+  return {
+    "fruit_type": "watermelon",
+    "fruit_name_zh": "小玉西瓜",
+    "score": round(avg_width_px, 2),
+    "group": group,
+    "quality": quality,
+    "description": desc,
+    "metrics": {
+      "stripe_width_px": round(avg_width_px, 2),
+      "stripe_ratio_pct": round(stripe_ratio, 2),
+      "contrast_diff": round(contrast_diff, 2),
+    },
+  }
 
 @app.post("/api/v1/classify")
 async def classify_fruit(file: UploadFile = File(...)):
@@ -384,47 +384,50 @@ async def classify_fruit(file: UploadFile = File(...)):
       )
       analysis_res["fruit_type"] = "unknown"
       analysis_res["fruit_name_zh"] = "未偵測到目標"
-      # 儲存標註結果圖
-      timestamp = ().strftime("%Y%m%d_%H%M%S")
-      unique_id = uuid.uuid4().hex[:8]
-      save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
-      save_path = os.path.join(UPLOAD_DIR, save_filename)
-      cv2.imwrite(save_path, annotated_img)
-      cleanup_old_images(max_keep=20)
-      del img_resized, annotated_img
-      gc.collect()
-      image_public_url = f"onrender.com{save_filename}"
-      print(
+      
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid.uuid4().hex[:8]
+    save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
+    save_path = os.path.join(UPLOAD_DIR, save_filename)
+    cv2.imwrite(save_path, annotated_img)
+    cleanup_old_images(max_keep=20)
+    del img_resized, annotated_img
+    gc.collect()
+
+    image_public_url = (
+        f"https://onrender.com{save_filename}"
+    )
+    print(
         f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
         f" {analysis_res['score']} | Group: {analysis_res['group']}"
-      )
-      return {
+    )
+    return {
         "status": "success",
         "data": {
-          "filename": file.filename,
-          "fruit_type": analysis_res["fruit_type"],
-          "fruit_name_zh": analysis_res["fruit_name_zh"],
-          "score": analysis_res["score"],
-          "group": analysis_res["group"],
-          "quality": analysis_res["quality"],
-          "description": analysis_res["description"],
-          "metrics": analysis_res["metrics"],
-          "yolo_detected": detected,
-          "image_url": image_public_url,
-          "version": model_config.get("version", "Unknown"),
+            "filename": file.filename,
+            "fruit_type": analysis_res["fruit_type"],
+            "fruit_name_zh": analysis_res["fruit_name_zh"],
+            "score": analysis_res["score"],
+            "group": analysis_res["group"],
+            "quality": analysis_res["quality"],
+            "description": analysis_res["description"],
+            "metrics": analysis_res["metrics"],
+            "yolo_detected": detected,
+            "image_url": image_public_url,
+            "version": model_config.get("version", "Unknown"),
         },
-      }
+    }
+
   except Exception as e:
     gc.collect()
-    raise HTTPException(
-      status_code=500, detail=f"伺服器處理失敗: {str(e)}"
-    )
-    @app.get("/")
-    def health_check():
-      return {
-        "status": "online",
-        "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
-        "model_file_exists": os.path.exists(MODEL_PATH),
-        "model_loaded": yolo_model is not None,
-        "current_config_version": model_config.get("version", "Unknown"),
-      }
+    raise HTTPException(status_code=500, detail=f"伺服器處理失敗: {str(e)}")
+
+@app.get("/")
+def health_check():
+  return {
+      "status": "online",
+      "message": "芭樂 & 小玉西瓜AI分級後端運作中",
+      "model_file_exists": os.path.exists(MODEL_PATH),
+      "model_loaded": yolo_model is not None,
+      "current_config_version": model_config.get("version", "Unknown"),
+  }
