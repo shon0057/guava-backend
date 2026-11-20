@@ -280,60 +280,156 @@ def analyze_watermelon(
 
 
 @app.post("/api/v1/classify")
-async def classify_fruit(request: Request, file: UploadFile = File(...)):
-    model = get_yolo_model()
-    if model is None:
-        raise HTTPException(status_code=500, detail="模型未就緒，找不到 best.pt")
+async def classify_fruit(file: UploadFile = File(...)):
+  model = get_yolo_model()
+  if model is None:
+    raise HTTPException(status_code=500, detail="模型未就緒，找不到 best.pt")
 
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        del contents, nparr
-        gc.collect()
+  try:
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    del contents, nparr
+    gc.collect()
 
-        if img_raw is None:
-            raise HTTPException(status_code=400, detail="無效的圖片檔案")
+    if img_raw is None:
+      raise HTTPException(status_code=400, detail="無效的圖片檔案")
 
-        # 縮放至寬度 640px 並進行 YOLO 推論與後續影像處理
-        # ...（略過部分細節，完整程式碼請見）
+    # 第一時間縮放至寬度 640px
+    h_raw, w_raw = img_raw.shape[:2]
+    target_w = 640
+    target_h = int(h_raw * (640.0 / w_raw))
 
-        base_url = str(request.base_url).rstrip("/")
-        image_public_url = f"{base_url}/static/uploads/{save_filename}"
+    img_resized = cv2.resize(
+        img_raw, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+    )
+    del img_raw
+    gc.collect()
 
-        return {
-            "status": "success",
-            "data": {
-                "filename": file.filename,
-                "fruit_type": analysis_res["fruit_type"],
-                "fruit_name_zh": analysis_res["fruit_name_zh"],
-                "score": analysis_res["score"],
-                "group": analysis_res["group"],
-                "quality": analysis_res["quality"],
-                "description": analysis_res["description"],
-                "metrics": analysis_res["metrics"],
-                "yolo_detected": detected,
-                "image_url": image_public_url,
-                "version": model_config.get("version", "Unknown"),
-            },
-        }
+    h, w, _ = img_resized.shape
 
-    except HTTPException:
-        # 讓 400 無效圖片錯誤能正確回傳 400，不會被下方攔截成 500
-        raise
-    except Exception as e:
-        gc.collect()
-        raise HTTPException(
-            status_code=500, detail=f"伺服器處理失敗: {str(e)}"
+    # YOLO 推論
+    with torch.inference_mode():
+      results = model.predict(
+          source=img_resized,
+          imgsz=640,
+          conf=0.45,
+          max_det=1,
+          verbose=False,
+          save=False,
+          show=False,
+      )
+
+    detected = False
+    annotated_img = img_resized.copy()
+    analysis_res = None
+
+    if len(results) > 0 and len(results[0].boxes) > 0:
+      box = results[0].boxes[0]
+      x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+      conf = float(box.conf[0])
+      cls_id = int(box.cls[0])
+      fruit_type = model.names[cls_id].lower()
+      detected = True
+
+      # 依果種繪製外框 (芭樂綠框、西瓜橘紅框)
+      box_color = (0, 255, 0) if "guava" in fruit_type else (0, 100, 255)
+      cv2.rectangle(annotated_img, (x1, y1), (x2, y2), box_color, 3)
+      cv2.putText(
+          annotated_img,
+          f"{fruit_type.upper()} {conf:.2f}",
+          (x1, max(25, y1 - 10)),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.8,
+          box_color,
+          2,
+      )
+
+      # 自動分流至對應演算法
+      if "watermelon" in fruit_type:
+        analysis_res = analyze_watermelon(
+            img_resized,
+            annotated_img,
+            (x1, y1, x2, y2),
+            model_config.get("watermelon", {}),
+        )
+      else:
+        analysis_res = analyze_guava(
+            img_resized,
+            annotated_img,
+            (x1, y1, x2, y2),
+            model_config.get("guava", {}),
         )
 
+    del results
+    gc.collect()
 
+    # 若未偵測到任何水果的防呆機制
+    if not detected:
+      cv2.putText(
+          annotated_img,
+          "NO FRUIT DETECTED (Fallback Center)",
+          (20, 40),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.75,
+          (0, 0, 255),
+          2,
+      )
+fallback_box = (
+  max(0, w // 2 - 125),
+  max(0, h // 2 - 125),
+  min(w, w // 2 + 125),
+  min(h, h // 2 + 125),
+)
+analysis_res = analyze_guava(
+  img_resized,
+  annotated_img,
+  fallback_box,
+  model_config.get("guava", {}),
+)
+analysis_res["fruit_type"] = "unknown"
+analysis_res["fruit_name_zh"] = "未偵測到目標"
+# 儲存標註結果圖
+timestamp = ().strftime("%Y%m%d_%H%M%S")
+unique_id = uuid.uuid4().hex[:8]
+save_filename = f"fruit_{timestamp}_{unique_id}.jpg"
+save_path = os.path.join(UPLOAD_DIR, save_filename)
+cv2.imwrite(save_path, annotated_img)
+cleanup_old_images(max_keep=20)
+del img_resized, annotated_img
+gc.collect()
+image_public_url = f"onrender.com{save_filename}"
+print(
+  f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
+  f" {analysis_res['score']} | Group: {analysis_res['group']}"
+)
+return {
+  "status": "success",
+    "data": {
+      "filename": file.filename,
+      "fruit_type": analysis_res["fruit_type"],
+      "fruit_name_zh": analysis_res["fruit_name_zh"],
+      "score": analysis_res["score"],
+      "group": analysis_res["group"],
+      "quality": analysis_res["quality"],
+      "description": analysis_res["description"],
+      "metrics": analysis_res["metrics"],
+      "yolo_detected": detected,
+      "image_url": image_public_url,
+      "version": model_config.get("version", "Unknown"),
+    },
+}
+except Exception as e:
+gc.collect()
+raise HTTPException(
+  status_code=500, detail=f"伺服器處理失敗: {str(e)}"
+)
 @app.get("/")
 def health_check():
-    return {
-        "status": "online",
-        "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
-        "model_file_exists": os.path.exists(MODEL_PATH),
-        "model_loaded": yolo_model is not None,
-        "current_config_version": model_config.get("version", "Unknown"),
-    }
+return {
+  "status": "online",
+  "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
+  "model_file_exists": os.path.exists(MODEL_PATH),
+  "model_loaded": yolo_model is not None,
+  "current_config_version": model_config.get("version", "Unknown"),
+}
