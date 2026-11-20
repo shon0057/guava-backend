@@ -398,7 +398,9 @@ cv2.imwrite(save_path, annotated_img)
 cleanup_old_images(max_keep=20)
 del img_resized, annotated_img
 gc.collect()
-image_public_url = f"onrender.com{save_filename}"
+image_public_url = (
+    f"https://onrender.com{save_filename}"
+)
 print(
 f"📸 [Processed] Type: {analysis_res['fruit_type']} | Score:"
 f" {analysis_res['score']} | Group: {analysis_res['group']}"
@@ -426,10 +428,10 @@ status_code=500, detail=f"伺服器處理失敗: {str(e)}"
 )
 @app.get("/")
 def health_check():
-return {
-"status": "online",
-"message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
-"model_file_exists": os.path.exists(MODEL_PATH),
-"model_loaded": yolo_model is not None,
-"current_config_version": model_config.get("version", "Unknown"),
-}
+  return {
+      "status": "online",
+      "message": "芭樂 & 小玉西瓜雙果種 AI 分級後端服務運作中",
+      "model_file_exists": os.path.exists(MODEL_PATH),
+      "model_loaded": yolo_model is not None,
+      "current_config_version": model_config.get("version", "Unknown"),
+  }
